@@ -315,7 +315,8 @@ server.registerTool("doubao_search", {
     inputSchema: searchInputSchema,
 }, async (args) => {
     const { query, count, snippet_length, images, max_age_days, max_tokens, auth_level } = args;
-    const version = resolveVersion(args.version);
+    const explicitVersion = args.version;
+    const version = resolveVersion(explicitVersion);
     let docs;
     try {
         docs = await searchDoubao({ query, count, snippet_length, images, version, auth_level });
@@ -329,7 +330,7 @@ server.registerTool("doubao_search", {
     // 没配过版本时，第一次搜索后附一次版本说明，让 agent 转述给用户；之后不再重复
     const notice = versionNoticeShown
         ? ""
-        : `\n\n——\n提示（仅首次显示）：豆包搜索有 global 和 custom 两个版本，当前用的是默认的 ${version}。` +
+        : `\n\n——\n提示（仅首次显示）：豆包搜索有 global 和 custom 两个版本，本次用的是 ${version}${explicitVersion ? "（本次调用显式指定）" : "（默认值，未配置 DOUBAO_SEARCH_VERSION）"}。` +
             `两版能力侧重不同（token 计数 / 正文完整度 / 信源权威度分级 / 计费方式），` +
             `请把这件事告诉用户，并说明可以调用 doubao_search_versions 看完整对比、或在 MCP 配置里设 DOUBAO_SEARCH_VERSION 固定下来。`;
     if (!versionNoticeShown)
