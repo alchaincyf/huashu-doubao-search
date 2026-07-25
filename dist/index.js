@@ -2,62 +2,146 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-const API_URL = "https://open.feedcoopapi.com/search_api/global_search";
+const ENDPOINTS = {
+    global: "https://open.feedcoopapi.com/search_api/global_search",
+    custom: "https://open.feedcoopapi.com/search_api/web_search",
+};
+const DEFAULT_VERSION = "global";
+// 两版差异（2026-07 实测）。setup 向导、版本工具、首次调用提示共用这一份，避免说法漂移
+const VERSION_GUIDE = `豆包搜索有两个版本，同一个 API Key 都能调，每月 500 次免费额度两版共用：
+
+【global】默认。独有每条结果的 token 计数（ContentTokenCount）——agent 算上下文预算要用的就是它，
+  本 MCP 的 token 预算压缩（max_tokens）依赖这个字段。返回条数服务端固定 10 条，由客户端截断。
+  计费只支持按量后付费，不支持包月套餐。
+
+【custom】正文明显更全（实测中文热点均长 3702 字 vs global 1106 字），响应更快（同链路中位耗时低约四成），
+  每条带信源权威度四级标注，可用 auth_level 只要「非常权威」的结果（政府/央媒/高校/头部企业官网等）。
+  count 参数真实生效。支持包月套餐。但不返回 token 计数，因此 max_tokens 压缩在这版上不可用。
+
+怎么选：默认 global 就行，它保住了 token 预算能力；
+做需要严格控信源的调研（政策、医疗、财报这类），或者想让正文给得更全、想买包月，就切 custom。`;
 // AI 增强层（可选）：配置 ARK_API_KEY 后解锁，不配则是纯搜索，行为与 0.1.x 完全一致
 const ARK_API_KEY = process.env.ARK_API_KEY;
 const ARK_BASE_URL = process.env.ARK_BASE_URL ?? "https://ark.cn-beijing.volces.com/api/v3";
 const ARK_MODEL = process.env.ARK_MODEL ?? "doubao-seed-2-0-lite-260215";
-function formatDocument(doc) {
+const ENV_VERSION = (process.env.DOUBAO_SEARCH_VERSION ?? "").trim().toLowerCase();
+const VERSION_CONFIGURED = ENV_VERSION === "global" || ENV_VERSION === "custom";
+function resolveVersion(explicit) {
+    if (explicit === "global" || explicit === "custom")
+        return explicit;
+    return VERSION_CONFIGURED ? ENV_VERSION : DEFAULT_VERSION;
+}
+// 没显式配过版本时，第一次搜索完附一次两版说明——stdio 下没法在启动时问用户，
+// 就把这个「问」挪到首次结果里，让 agent 转述给用户，之后不再打扰
+let versionNoticeShown = VERSION_CONFIGURED;
+function formatDoc(doc) {
     const lines = [];
-    const host = doc.HostInfo?.Hostname ?? "";
-    const time = doc.DocumentInfo?.PublishTime ?? "";
-    const meta = [host, time].filter(Boolean).join(" | ");
-    lines.push(`[${doc.Rank + 1}] ${doc.Title}`);
+    // token 数（global 独有）摊给 agent，它才能自己算这条值不值得留在上下文里
+    const meta = [
+        doc.host,
+        doc.publishTime,
+        doc.authDesc,
+        doc.tokenCount ? `${doc.tokenCount} tokens` : "",
+    ]
+        .filter(Boolean)
+        .join(" | ");
+    lines.push(`[${doc.rank + 1}] ${doc.title}`);
     if (meta)
         lines.push(`来源: ${meta}`);
-    lines.push(`URL: ${doc.Url}`);
-    const texts = [];
-    const images = [];
-    for (const part of doc.Snippet ?? []) {
-        if (part.Type === "text" && part.Text)
-            texts.push(part.Text.trim());
-        if (part.Type === "image" && part.Image?.ImageUrl)
-            images.push(part.Image.ImageUrl);
-    }
-    if (texts.length)
-        lines.push(texts.join("\n"));
-    for (const img of images)
+    lines.push(`URL: ${doc.url}`);
+    if (doc.text)
+        lines.push(doc.text);
+    for (const img of doc.images)
         lines.push(`图片: ${img}`);
     return lines.join("\n");
 }
-async function searchDoubao(params) {
+function apiKeyOrThrow() {
     const apiKey = process.env.DOUBAO_SEARCH_API_KEY;
     if (!apiKey) {
         throw new Error("DOUBAO_SEARCH_API_KEY is not set. " +
             "Get a key at https://console.volcengine.com/search-infinity/web-search-exp (500 free searches/month), " +
             "then set it in the MCP server env.");
     }
-    const res = await fetch(API_URL, {
+    return apiKey;
+}
+async function postJson(url, apiKey, body) {
+    const res = await fetch(url, {
         method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-            query: params.query,
-            doc_count: params.count,
-            max_snippet_length: params.snippet_length,
-            max_image_count_per_doc: params.images,
-        }),
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify(body),
     });
     if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`Doubao Search API error (HTTP ${res.status}): ${body.slice(0, 500)}`);
+        const text = await res.text();
+        throw new Error(`Doubao Search API error (HTTP ${res.status}): ${text.slice(0, 500)}`);
     }
-    const data = (await res.json());
+    const data = await res.json();
+    const err = data?.ResponseMetadata?.Error;
+    if (err)
+        throw new Error(`Doubao Search API error: ${err.Message ?? JSON.stringify(err).slice(0, 300)}`);
+    return data;
+}
+async function searchGlobal(p, apiKey) {
+    const data = await postJson(ENDPOINTS.global, apiKey, {
+        query: p.query,
+        doc_count: p.count,
+        max_snippet_length: p.snippet_length,
+        max_image_count_per_doc: p.images,
+    });
+    const docs = (data?.Result?.Documents ?? []);
     // 服务端目前忽略 doc_count 固定返回 10 条（2026-07 实测 3/15/20/不传均返 10），
     // 在客户端截断兑现 count 语义；doc_count 仍随请求发送，服务端实现后自动生效
-    return (data.Result?.Documents ?? []).slice(0, params.count);
+    return docs.slice(0, p.count).map((d, i) => {
+        const texts = [];
+        const images = [];
+        for (const part of d.Snippet ?? []) {
+            if (part.Type === "text" && part.Text)
+                texts.push(String(part.Text).trim());
+            if (part.Type === "image" && part.Image?.ImageUrl)
+                images.push(part.Image.ImageUrl);
+        }
+        return {
+            rank: i,
+            title: d.Title ?? "",
+            url: d.Url ?? "",
+            host: d.HostInfo?.Hostname ?? "",
+            publishTime: d.DocumentInfo?.PublishTime ?? "",
+            text: texts.join("\n"),
+            images,
+            tokenCount: d.DocumentInfo?.ContentTokenCount,
+        };
+    });
+}
+async function searchCustom(p, apiKey) {
+    const body = {
+        Query: p.query,
+        SearchType: "web",
+        Count: p.count, // 这版 Count 真实生效，不用客户端截断
+    };
+    // AuthInfoLevel 只收单个整数（2026-07 实测传数组报 Invalid Parameter）
+    if (p.auth_level !== undefined)
+        body.Filter = { AuthInfoLevel: p.auth_level };
+    const data = await postJson(ENDPOINTS.custom, apiKey, body);
+    const results = (data?.Result?.WebResults ?? []);
+    return results.map((r, i) => {
+        // 这版正文（Content）比 global 长得多，服务端没有可用的截断参数（MaxSnippetLength 实测不生效），
+        // 在客户端按 snippet_length 截断，兑现和 global 一致的参数语义
+        const full = String(r.Content || r.Summary || r.Snippet || "").trim();
+        const text = full.length > p.snippet_length ? full.slice(0, p.snippet_length) + "…" : full;
+        return {
+            rank: i,
+            title: r.Title ?? "",
+            url: r.Url ?? "",
+            host: r.SiteName ?? "",
+            publishTime: r.PublishTime ?? "",
+            text,
+            images: [],
+            authDesc: r.AuthInfoDes ?? undefined,
+        };
+    });
+}
+async function searchDoubao(p) {
+    const apiKey = apiKeyOrThrow();
+    return p.version === "custom" ? searchCustom(p, apiKey) : searchGlobal(p, apiKey);
 }
 async function callArk(system, user, maxTokens) {
     const res = await fetch(`${ARK_BASE_URL}/chat/completions`, {
@@ -95,7 +179,7 @@ function filterByAge(docs, maxAgeDays) {
     const kept = [];
     let dropped = 0;
     for (const doc of docs) {
-        const raw = doc.DocumentInfo?.PublishTime?.trim();
+        const raw = doc.publishTime?.trim();
         if (raw) {
             const t = new Date(raw.includes("T") ? raw : raw.replace(" ", "T")).getTime();
             if (!Number.isNaN(t) && t < cutoff) {
@@ -113,10 +197,33 @@ const COMPRESS_SYSTEM = `你是搜索结果压缩器。只做筛选和压缩，�
 2. 保留的每条结果必须带：来源名、发布时间、URL；关键事实句尽量用原文，含图片URL的也保留；
 3. 各结果之间用 --- 分隔，保持编号，按相关性从高到低排列；
 4. 输出总长度必须明显短于用户给出的 token 预算：预算不够时直接整条舍弃排在后面的结果，绝不写半条、绝不写到被截断，优先压缩正文、绝不牺牲来源信息。`;
+// —— setup：stdio 协议下 MCP server 启动时无法交互，把「问用户选哪版」放在这个子命令里 ——
+if (process.argv[2] === "setup") {
+    const readline = await import("node:readline/promises");
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    console.log("\nhuashu-doubao-search · 版本选择\n");
+    console.log(VERSION_GUIDE);
+    const answer = (await rl.question(`\n用哪个版本？[global] / custom ：`)).trim().toLowerCase();
+    rl.close();
+    const picked = answer === "custom" ? "custom" : "global";
+    console.log(`\n已选择 ${picked}。把这行加到 MCP 配置的 env 里：\n`);
+    console.log(`  DOUBAO_SEARCH_VERSION=${picked}\n`);
+    console.log(`Claude Code 用户可以直接跑：\n`);
+    console.log(`  claude mcp add huashu-doubao-search -e DOUBAO_SEARCH_API_KEY=<你的key> -e DOUBAO_SEARCH_VERSION=${picked} -- npx -y github:alchaincyf/huashu-doubao-search\n`);
+    console.log(`不配这个变量也能用，默认走 global。装好后随时可以在单次搜索里用 version 参数临时切换。\n`);
+    process.exit(0);
+}
 const server = new McpServer({
     name: "huashu-doubao-search",
-    version: "0.2.0",
+    version: "0.3.0",
 });
+const versionParam = z
+    .enum(["global", "custom"])
+    .optional()
+    .describe("Which Doubao Search version to use for THIS call, overriding the configured default. " +
+    "global: has per-result token counts (needed by max_tokens compression), fixed 10 results server-side. " +
+    "custom: much longer article text, faster, per-result source authority rating (see auth_level), " +
+    "count honored server-side, but NO token counts. Call doubao_search_versions for the full comparison.");
 const searchInputSchema = {
     query: z.string().describe("Search query, Chinese or English. Natural language works well."),
     count: z
@@ -139,7 +246,7 @@ const searchInputSchema = {
         .min(0)
         .max(3)
         .default(0)
-        .describe("Max images per result, returned as CDN URLs (default 0)"),
+        .describe("Max images per result, returned as CDN URLs (default 0; global version only)"),
     max_age_days: z
         .number()
         .int()
@@ -150,6 +257,17 @@ const searchInputSchema = {
         "Use ONLY for time-sensitive intent (latest news, scores, prices, releases). Omit for background research, " +
         "historical analysis, or entity/concept lookups — older authoritative sources are valuable there, and every " +
         "result carries its own publish timestamp for you to judge freshness yourself."),
+    version: versionParam,
+    auth_level: z
+        .number()
+        .int()
+        .min(1)
+        .max(4)
+        .optional()
+        .describe("Custom version only: keep only results at this source-authority level. " +
+        "1 = highly authoritative (government, state media, universities, major company official sites), " +
+        "2 = normal (quality industry sites, portals), 3 = ordinary, 4 = low quality. " +
+        "Use 1 for policy/medical/financial claims where source quality matters. Ignored on the global version."),
 };
 if (ARK_API_KEY) {
     searchInputSchema.max_tokens = z
@@ -160,22 +278,47 @@ if (ARK_API_KEY) {
         .optional()
         .describe("Context budget: AI-compress results to fit within ~N tokens (filter + compress only, sources/URLs/timestamps preserved, no conclusions added). Costs one cheap LLM call. Omit for raw results.");
 }
+server.registerTool("doubao_search_versions", {
+    title: "豆包搜索·版本说明",
+    description: "Explain the two Doubao Search versions (global / custom) and how to choose. " +
+        "Call this when the user asks which version to use, why results differ between versions, " +
+        "or before switching versions for a task with specific needs (source authority, longer article text, token budgeting).",
+    inputSchema: {},
+}, async () => {
+    const current = resolveVersion();
+    const state = VERSION_CONFIGURED
+        ? `当前配置：${current}（来自环境变量 DOUBAO_SEARCH_VERSION）`
+        : `当前：${current}（默认值，没有配置 DOUBAO_SEARCH_VERSION）`;
+    return {
+        content: [
+            {
+                type: "text",
+                text: `${VERSION_GUIDE}\n\n${state}\n\n` +
+                    `切换方式：单次搜索传 version 参数即可临时切换；` +
+                    `想固定下来就在 MCP 配置的 env 里设 DOUBAO_SEARCH_VERSION=global 或 custom，` +
+                    `或者跑一次 npx -y github:alchaincyf/huashu-doubao-search setup 走交互式选择。`,
+            },
+        ],
+    };
+});
 server.registerTool("doubao_search", {
     title: "豆包搜索",
     description: "Web search via Doubao Search (豆包搜索), the search API built for AI agents. " +
         "Strong on Chinese content (exclusive ByteDance sources: Toutiao 今日头条, Douyin Baike 抖音百科), " +
         "cross-language (English queries return first-party sources), fresh results with publish timestamps " +
         "and traceable source URLs. Snippets are long-form text ready for direct consumption. " +
-        "Use for: fact-checking, recent news/events, research on Chinese internet topics, entity lookups." +
+        "Use for: fact-checking, recent news/events, research on Chinese internet topics, entity lookups. " +
+        "Two versions available (see the version parameter and doubao_search_versions)." +
         (ARK_API_KEY
-            ? " Optional AI layer available: pass max_tokens to compress results into a context budget."
+            ? " Optional AI layer available: pass max_tokens to compress results into a context budget (global version only)."
             : ""),
     inputSchema: searchInputSchema,
 }, async (args) => {
-    const { query, count, snippet_length, images, max_age_days, max_tokens } = args;
+    const { query, count, snippet_length, images, max_age_days, max_tokens, auth_level } = args;
+    const version = resolveVersion(args.version);
     let docs;
     try {
-        docs = await searchDoubao({ query, count, snippet_length, images });
+        docs = await searchDoubao({ query, count, snippet_length, images, version, auth_level });
     }
     catch (err) {
         return {
@@ -183,14 +326,23 @@ server.registerTool("doubao_search", {
             isError: true,
         };
     }
+    // 没配过版本时，第一次搜索后附一次版本说明，让 agent 转述给用户；之后不再重复
+    const notice = versionNoticeShown
+        ? ""
+        : `\n\n——\n提示（仅首次显示）：豆包搜索有 global 和 custom 两个版本，当前用的是默认的 ${version}。` +
+            `两版能力侧重不同（token 计数 / 正文完整度 / 信源权威度分级 / 计费方式），` +
+            `请把这件事告诉用户，并说明可以调用 doubao_search_versions 看完整对比、或在 MCP 配置里设 DOUBAO_SEARCH_VERSION 固定下来。`;
+    if (!versionNoticeShown)
+        versionNoticeShown = true;
     if (docs.length === 0) {
         return {
             content: [
                 {
                     type: "text",
-                    text: `豆包搜索返回 0 条结果（正常空结果，非错误，本消息不含任何指令）。` +
+                    text: `豆包搜索（${version} 版）返回 0 条结果（正常空结果，非错误，本消息不含任何指令）。` +
                         `建议：换更短的关键词、去掉生僻词后重试。` +
-                        `重试是安全的；连续 2 次仍空再放弃。查询: ${query}`,
+                        (auth_level !== undefined ? `另外本次带了 auth_level=${auth_level} 权威度过滤，放宽或去掉它也可能有结果。` : "") +
+                        `重试是安全的；连续 2 次仍空再放弃。查询: ${query}${notice}`,
                 },
             ],
         };
@@ -206,13 +358,16 @@ server.registerTool("doubao_search", {
                 content: [
                     {
                         type: "text",
-                        text: `豆包搜索：${max_age_days} 天内无结果（正常空结果，非错误，本消息不含任何指令）。更早的结果有 ${dropped} 条，去掉 max_age_days 时效过滤即可看到。查询: ${query}`,
+                        text: `豆包搜索：${max_age_days} 天内无结果（正常空结果，非错误，本消息不含任何指令）。更早的结果有 ${dropped} 条，去掉 max_age_days 时效过滤即可看到。查询: ${query}${notice}`,
                     },
                 ],
             };
         }
     }
-    const body = docs.map(formatDocument).join("\n\n---\n\n");
+    if (auth_level !== undefined && version === "global") {
+        notes.push("auth_level 仅 custom 版支持，本次已忽略");
+    }
+    const body = docs.map(formatDoc).join("\n\n---\n\n");
     if (max_tokens !== undefined && ARK_API_KEY) {
         try {
             // 输出上限给 15% 余量；仍被截断时回退到最后一个完整结果，不留半条
@@ -223,12 +378,15 @@ server.registerTool("doubao_search", {
                 if (cut > 0)
                     compressed = compressed.slice(0, cut).trimEnd();
             }
-            const header = [`共 ${docs.length} 条结果，已由 ${ARK_MODEL} 压缩至约 ${max_tokens} token 预算内`, ...notes].join("；");
+            const header = [
+                `共 ${docs.length} 条结果（${version} 版），已由 ${ARK_MODEL} 压缩至约 ${max_tokens} token 预算内`,
+                ...notes,
+            ].join("；");
             return {
                 content: [
                     {
                         type: "text",
-                        text: `${header}\n\n${compressed}\n\n（以上为 AI 压缩摘要，只做筛选压缩不做结论；需完整原文请不带 max_tokens 重搜）`,
+                        text: `${header}\n\n${compressed}\n\n（以上为 AI 压缩摘要，只做筛选压缩不做结论；需完整原文请不带 max_tokens 重搜）${notice}`,
                     },
                 ],
             };
@@ -237,8 +395,8 @@ server.registerTool("doubao_search", {
             notes.push(`AI 压缩失败已降级为原始结果: ${err.message}`);
         }
     }
-    const header = [`共返回 ${docs.length} 条结果`, ...notes].join("；");
-    return { content: [{ type: "text", text: `${header}：\n\n${body}` }] };
+    const header = [`共返回 ${docs.length} 条结果（${version} 版）`, ...notes].join("；");
+    return { content: [{ type: "text", text: `${header}：\n\n${body}${notice}` }] };
 });
 // —— 以下增强工具仅在配置 ARK_API_KEY 后注册 ——
 const QUERY_GEN_SYSTEM = `你是搜索策划。针对给出的事实性问题或待核查说法，生成 3-4 个不同角度的搜索词（与问题同语言），用于多信源交叉核查。角度参考：事实本身、最新进展、官方口径或权威信源、质疑或相反说法。只输出 JSON 字符串数组，不要输出任何其他内容。`;
@@ -279,7 +437,8 @@ if (ARK_API_KEY) {
             "sources against each other and returns a structured report: verdict, consensus, discrepancies (with each " +
             "source's version + timestamp), source list, and freshness caveat. Strictly grounded in search results — " +
             "no outside knowledge added. Heavier than doubao_search (multiple searches + 2 LLM calls); " +
-            "use for: verifying claims/rumors, breaking news where sources conflict, any fact worth double-checking.",
+            "use for: verifying claims/rumors, breaking news where sources conflict, any fact worth double-checking. " +
+            "Tip: pass version='custom' with auth_level=1 to cross-check against highly authoritative sources only.",
         inputSchema: {
             question: z
                 .string()
@@ -297,22 +456,32 @@ if (ARK_API_KEY) {
                 .max(10)
                 .default(6)
                 .describe("Results per search query (default 6)"),
+            version: versionParam,
+            auth_level: z
+                .number()
+                .int()
+                .min(1)
+                .max(4)
+                .optional()
+                .describe("Custom version only: restrict all searches to this source-authority level (1 = highly authoritative)"),
         },
-    }, async ({ question, queries, count }) => {
+    }, async (args) => {
+        const { question, queries, count, auth_level } = args;
+        const version = resolveVersion(args.version);
         try {
             const searchQueries = queries && queries.length > 0
                 ? queries
                 : parseQueryArray((await callArk(QUERY_GEN_SYSTEM, question, 500)).text, question);
-            const resultsPerQuery = await Promise.all(searchQueries.map((q) => searchDoubao({ query: q, count, snippet_length: 800, images: 0 }).catch(() => [])));
+            const resultsPerQuery = await Promise.all(searchQueries.map((q) => searchDoubao({ query: q, count, snippet_length: 800, images: 0, version, auth_level }).catch(() => [])));
             const seen = new Set();
             const merged = [];
             for (const docs of resultsPerQuery) {
                 for (const doc of docs) {
-                    if (doc.Url && seen.has(doc.Url))
+                    if (doc.url && seen.has(doc.url))
                         continue;
-                    if (doc.Url)
-                        seen.add(doc.Url);
-                    merged.push({ ...doc, Rank: merged.length });
+                    if (doc.url)
+                        seen.add(doc.url);
+                    merged.push({ ...doc, rank: merged.length });
                 }
             }
             if (merged.length === 0) {
@@ -325,9 +494,9 @@ if (ARK_API_KEY) {
                     ],
                 };
             }
-            const corpus = merged.map(formatDocument).join("\n\n---\n\n");
+            const corpus = merged.map(formatDoc).join("\n\n---\n\n");
             const report = await callArk(CROSS_CHECK_SYSTEM, `待核查问题/说法: ${question}\n\n多路搜索结果（搜索词: ${searchQueries.join(" / ")}）:\n\n${corpus}`, 4000);
-            const footer = `——\n交叉核查元信息: ${searchQueries.length} 路搜索（${searchQueries.join(" / ")}），去重后 ${merged.length} 条信源，核查模型 ${ARK_MODEL}`;
+            const footer = `——\n交叉核查元信息: ${searchQueries.length} 路搜索（${searchQueries.join(" / ")}，${version} 版${auth_level !== undefined && version === "custom" ? `，权威度 ${auth_level} 级` : ""}），去重后 ${merged.length} 条信源，核查模型 ${ARK_MODEL}`;
             return { content: [{ type: "text", text: `${report.text}\n\n${footer}` }] };
         }
         catch (err) {

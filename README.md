@@ -96,6 +96,31 @@ claude mcp add huashu-doubao-search \
 帮我安装这个 MCP：https://github.com/alchaincyf/huashu-doubao-search
 ```
 
+### 第三步（可选）：选一个搜索版本
+
+豆包搜索开放了 **global** 和 **custom** 两个版本，同一个 API Key 都能调，每月 500 次免费额度两版共用。不配也能用，默认走 global。
+
+想搞清楚该选哪个，跑一次交互式向导，它会介绍差异并给出配置命令：
+
+```bash
+npx -y github:alchaincyf/huashu-doubao-search setup
+```
+
+或者直接在 env 里加一行 `DOUBAO_SEARCH_VERSION=global`（或 `custom`）。装好之后，单次搜索传 `version` 参数还能临时切换，也可以让 agent 调 `doubao_search_versions` 工具随时查两版对比。
+
+### 两个版本怎么选
+
+| | **global**（默认） | **custom** |
+|---|---|---|
+| 每条结果 token 计数 | ✅ 独有 | ❌ 不返回 |
+| 正文完整度 | 中文热点均长约 1100 字 | 明显更全，同题实测约 3700 字 |
+| 响应速度 | — | 同链路中位耗时低约四成 |
+| 信源权威度分级 | ❌ 暂不支持 | ✅ 四级标注，可用 `auth_level` 过滤 |
+| `count` 参数 | 服务端固定返 10 条，客户端截断 | 服务端真实生效 |
+| 计费 | 仅按量后付费 | 支持包月套餐 |
+
+一句话：**默认 global 就行**，它保住了 token 预算能力（`max_tokens` 压缩依赖 `ContentTokenCount`，这个字段只有 global 有）；做政策、医疗、财报这类需要严格控信源的调研，或者想让正文给得更全、想买包月，就切 custom。
+
 ### 从源码安装
 
 ```bash
@@ -118,6 +143,10 @@ claude mcp add huashu-doubao-search \
 | `snippet_length` | int 50-2000 | 600 | 每条摘要的最大字符数，深度阅读时调大 |
 | `images` | int 0-3 | 0 | 每条结果最多返回几张图（CDN 直链，带宽高） |
 | `max_age_days` | int 1-365 | 关 | 时效过滤：剔除 N 天前发布的结果（无时间戳的保留）。纯代码实现，不花钱 |
+| `version` | `global` \| `custom` | 跟随配置 | 本次搜索用哪个版本，覆盖默认配置 |
+| `auth_level` | int 1-4 | 关 | **仅 custom 版**：只保留该权威等级的结果。1 = 非常权威（政府 / 央媒 / 高校 / 头部企业官网），2 = 正常权威，3 = 一般，4 = 一般不权威。查政策、医疗、财报这类事实时用 1 |
+
+另有一个 `doubao_search_versions` 工具，让 agent 随时能查两个版本的完整对比和当前配置。
 
 ## 可选：AI 增强层
 

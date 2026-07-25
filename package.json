@@ -1,6 +1,6 @@
 {
   "name": "huashu-doubao-search",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for Doubao Search (豆包搜索) — web search built for AI agents, with ByteDance-exclusive sources (Toutiao, Douyin Baike) and an optional AI layer (context budget compression, multi-source cross-check)",
   "type": "module",
   "bin": {
