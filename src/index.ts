@@ -617,5 +617,32 @@ if (ARK_API_KEY) {
   );
 }
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Auto-reconnect loop: recover from transient transport disconnects with exponential backoff
+(async () => {
+  let retryCount = 0;
+  let retryDelay = 1000;
+  const MAX_RETRIES = 10;
+  const MAX_RETRY_DELAY = 30000;
+
+  while (retryCount < MAX_RETRIES) {
+    try {
+      const transport = new StdioServerTransport();
+      await server.connect(transport);
+      retryCount = 0;
+      retryDelay = 1000;
+    } catch (err) {
+      retryCount++;
+      console.error(
+        `Transport error (attempt ${retryCount}/${MAX_RETRIES}): ${(err as Error).message}`
+      );
+      await sleep(retryDelay);
+      retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
+    }
+  }
+  console.error("Max reconnect attempts reached, exiting");
+  process.exit(1);
+})();
